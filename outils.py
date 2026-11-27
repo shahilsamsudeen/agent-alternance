@@ -6,6 +6,12 @@ from google.genai import types
 from openpyxl import load_workbook
 from pypdf import PdfReader
 
+import os
+import time
+import requests
+
+import html
+
 # ---------- Outil 1 : lire une offre ----------
 def lire_offre(chemin: str) -> dict:
     fichier = Path(chemin)
@@ -119,6 +125,64 @@ def ajouter_au_tableau(poste: str, entreprise: str, lien: str, score: int,
 
 
 
+# ---------- Outil 5 : chercher des offres sur La bonne alternance ----------
+URL_LBA = "https://api.apprentissage.beta.gouv.fr/api/job/v1/search"
+BONDY = {"latitude": 48.9022, "longitude": 2.4828}
+
+
+def _lire(donnees, chemin, defaut="non précisé"):
+    """Lit une valeur imbriquée : _lire(offre, 'workplace.name') = offre['workplace']['name']."""
+    for cle in chemin.split("."):
+        if not isinstance(donnees, dict) or donnees.get(cle) in (None, ""):
+            return defaut
+        donnees = donnees[cle]
+    return donnees
+
+
+def chercher_offres(codes_rome: str, rayon_km: int = 60, nombre: int = 10) -> dict:
+    """Cherche des offres en alternance autour de Bondy sur La bonne alternance."""
+    jeton = os.environ.get("LBA_API_TOKEN")
+    if not jeton:
+        return {"erreur": "LBA_API_TOKEN manquant dans le fichier .env."}
+    try:
+        reponse = requests.get(
+            URL_LBA,
+            headers={"Authorization": f"Bearer {jeton}", "Accept": "application/json"},
+            params={"romes": codes_rome.replace(" ", ""), "radius": int(rayon_km), **BONDY},
+            timeout=30,
+        )
+    except requests.RequestException as e:
+        return {"erreur": f"Connexion impossible : {type(e).__name__}"}
+
+    if reponse.status_code != 200:
+        return {"erreur": f"Recherche refusée (code {reponse.status_code}) : {reponse.text[:300]}"}
+
+    offres = []
+    deja_vues = set()
+    for o in reponse.json().get("jobs", []):
+        titre = html.unescape(str(_lire(o, "offer.title")))
+        entreprise = _lire(o, "workplace.name")
+        cle = (titre.lower(), str(entreprise).lower())
+        if cle in deja_vues:
+            continue          # même poste dans la même entreprise : on l'ignore
+        deja_vues.add(cle)
+
+        offres.append({
+            "id": _lire(o, "identifier.id"),
+            "titre": titre,
+            "entreprise": entreprise,
+            "lieu": _lire(o, "workplace.location.address"),
+            "contrat": ", ".join(_lire(o, "contract.type", [])) or "non précisé",
+            "debut": _lire(o, "contract.start"),
+            "lien": _lire(o, "apply.url"),
+            "description": str(_lire(o, "offer.description", ""))[:1500],
+        })
+        if len(offres) >= max(1, min(int(nombre), 20)):
+            break
+    return {"nombre": len(offres), "offres": offres}
+
+
+
 # ---------- Les fiches que le LLM lit ----------
 DECLARATIONS = [
     types.FunctionDeclaration(
@@ -165,6 +229,23 @@ DECLARATIONS = [
             "required": ["poste", "entreprise", "lien", "score", "competences"],
         },
     ),
+        types.FunctionDeclaration(
+        name="chercher_offres",
+        description="Cherche des offres en alternance actives autour de Bondy sur La bonne alternance, "
+                    "à partir de codes métiers ROME. Codes utiles en informatique : "
+                    "M1805 études et développement informatique, M1810 production et exploitation de SI, "
+                    "M1801 administration de systèmes d'information, M1802 expertise et support en SI, "
+                    "I1401 maintenance informatique et bureautique.",
+        parameters={
+            "type": "OBJECT",
+            "properties": {
+                "codes_rome": {"type": "STRING", "description": "Un ou plusieurs codes ROME séparés par des virgules, ex. 'M1810,M1801'"},
+                "rayon_km": {"type": "INTEGER", "description": "Rayon de recherche autour de Bondy en km : 10, 30, 60 ou 100"},
+                "nombre": {"type": "INTEGER", "description": "Nombre d'offres à récupérer, de 1 à 20"},
+            },
+            "required": ["codes_rome"],
+        },
+    ),
 ] 
 
 
@@ -174,4 +255,5 @@ OUTILS = {
     "lire_cv": lire_cv,
     "verifier_doublon": verifier_doublon,
     "ajouter_au_tableau": ajouter_au_tableau,
+    "chercher_offres": chercher_offres,
 }
